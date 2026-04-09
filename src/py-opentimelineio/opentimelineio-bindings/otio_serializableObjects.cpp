@@ -155,8 +155,30 @@ private:
     size_t _it;
 };
 
+// Fixed GC traverse for SerializableObject.
+// Prevents double-traversal of __dict__ when a Python class subclasses SerializableObject.
+// CPython's subtype_traverse calls the base tp_traverse AND visits __dict__ itself when
+// subclass.tp_dictoffset != base.tp_dictoffset — decrementing gc_refs twice and crashing
+// Python debug builds (gc_decref: Assertion "gc_get_refs(g) > 0" failed).
+// By checking Py_TYPE(self)->tp_traverse == otio_serializableobject_traverse, we skip
+// the dict visit when called indirectly from subtype_traverse (Python subclass case).
+static int otio_serializableobject_traverse(PyObject *self, visitproc visit, void *arg) {
+#if PY_VERSION_HEX >= 0x030D0000
+    PyObject_VisitManagedDict(self, visit, arg);
+#else
+    if (Py_TYPE(self)->tp_traverse == otio_serializableobject_traverse) {
+        PyObject *&dict = *_PyObject_GetDictPtr(self);
+        Py_VISIT(dict);
+    }
+#endif
+#if PY_VERSION_HEX >= 0x03090000
+    Py_VISIT(Py_TYPE(self));
+#endif
+    return 0;
+}
+
 static void define_bases1(py::module m) {
-    py::class_<SerializableObject, managing_ptr<SerializableObject>>(m, "SerializableObject", py::dynamic_attr(), "Superclass for all classes whose instances can be serialized.")
+    auto so_class = py::class_<SerializableObject, managing_ptr<SerializableObject>>(m, "SerializableObject", py::dynamic_attr(), "Superclass for all classes whose instances can be serialized.")
         .def(py::init<>())
         .def_property_readonly("_dynamic_fields", [](SerializableObject* s) {
                 auto ptr = s->dynamic_fields().get_or_create_mutation_stamp();
@@ -181,6 +203,14 @@ static void define_bases1(py::module m) {
         .def("schema_name", &SerializableObject::schema_name)
         .def("schema_version", &SerializableObject::schema_version)
         .def_property_readonly("is_unknown_schema", &SerializableObject::is_unknown_schema);
+
+    // Install fixed tp_traverse to prevent double-traversal GC crash in Python debug builds
+    // when Python classes (e.g. opentimelineio.plugins.manifest.Manifest) subclass SerializableObject.
+    {
+        auto *tp = reinterpret_cast<PyTypeObject *>(so_class.ptr());
+        tp->tp_traverse = otio_serializableobject_traverse;
+        PyType_Modified(tp);
+    }
 
     py::class_<UnknownSchema, SerializableObject, managing_ptr<UnknownSchema>>(m, "UnknownSchema")
         .def_property_readonly("original_schema_name", &UnknownSchema::original_schema_name)
